@@ -5,17 +5,30 @@
 //!   - SimpleDO : simple.m3u8 blocking + WS viewer push.
 //!
 //! Worker entry routes:
-//!   /hls/{app}/{sid}/playlist.m3u8   → hash(IP) % MAX_SHARDS → LlHlsDO[shard_id] (blocking HTTP)
-//!   /hls/{app}/{sid}/simple.m3u8     → hash(IP) % MAX_SHARDS → SimpleDO[shard_id] (blocking HTTP)
-//!   /hls/{app}/{sid}/playlist-ws     → LlHlsDO[hash shard] (WebSocket viewer push)
-//!   /hls/{app}/{sid}/simple-ws       → SimpleDO[hash shard] (WebSocket viewer push)
-//!   /browser/hls/{uuid}/playlist.m3u8  → LlHlsDO[hash shard] (browser publish relay)
-//!   /browser/hls/{uuid}/simple.m3u8    → SimpleDO[hash shard] (browser publish relay)
-//! (rendition variants: insert /{rendition}/ before the filename)
+//!   Software streams:
+//!     /hls/{app}/{sid}/master.m3u8
+//!     /hls/{app}/{sid}[/{rendition}]/playlist.m3u8
+//!     /hls/{app}/{sid}[/{rendition}]/simple.m3u8
+//!     /hls/{app}/{sid}[/{rendition}]/playlist-ws
+//!     /hls/{app}/{sid}[/{rendition}]/simple-ws
+//!
+//!   Browser streams:
+//!     /browser/hls/{uuid}/master.m3u8
+//!     /browser/hls/{uuid}[/{rendition}]/playlist.m3u8
+//!     /browser/hls/{uuid}[/{rendition}]/simple.m3u8
+//!     /browser/hls/{uuid}[/{rendition}]/playlist-ws
+//!     /browser/hls/{uuid}[/{rendition}]/simple-ws
+//!
+//! Routing:
+//!   master.m3u8   → hash(IP) % MAX_SHARDS → LlHlsDO[shard_id] (blocking HTTP)
+//!   playlist.m3u8 → hash(IP) % MAX_SHARDS → LlHlsDO[shard_id] (blocking HTTP)
+//!   simple.m3u8   → hash(IP) % MAX_SHARDS → SimpleDO[shard_id] (blocking HTTP)
+//!   playlist-ws   → LlHlsDO[hash shard] (WebSocket viewer push)
+//!   simple-ws     → SimpleDO[hash shard] (WebSocket viewer push)
 //!
 //! Stream key format:
-//!   Software: "{app}:{sid}" or "{app}:{sid}:{rendition}"
-//!   Browser:  "{uuid}" (stream_id only)
+//!   Software: "{app}:{sid}" or "{app}:{sid}:{rendition}" ("original" maps to "{app}:{sid}")
+//!   Browser:  "browser:{uuid}" (rendition path is accepted but not part of the stream key)
 //!
 //! WebSocket viewer protocol (DO → client):
 //!   { "type": "part",   "msn": N, "part": N, "playlist": "..." }
@@ -26,7 +39,9 @@
 
 use futures_channel::oneshot;
 use futures_util::StreamExt;
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{cell::RefCell, rc::Rc};
 use worker::*;
 
@@ -89,17 +104,30 @@ struct HlsQuery {
     part: u32,
 }
 
+#[derive(Debug)]
+enum JwtAuthError {
+    MissingConfig,
+    Unauthorized,
+}
+
 // ── Worker entry ──────────────────────────────────────────────────────────────
 #[event(fetch)]
 pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     // CORS preflight
     if req.method() == Method::Options {
-        let mut h = Headers::new();
+        let h = Headers::new();
         h.set("Access-Control-Allow-Origin", "*")?;
         h.set("Access-Control-Allow-Methods", "GET, OPTIONS")?;
         h.set("Access-Control-Allow-Headers", "*")?;
         h.set("Access-Control-Max-Age", "86400")?;
         return Response::empty().map(|r| r.with_headers(h));
+    }
+
+    if let Err(e) = verify_jwt(&req, &env) {
+        return match e {
+            JwtAuthError::MissingConfig => cors_error("JWT auth is not configured", 500),
+            JwtAuthError::Unauthorized => cors_error("Unauthorized", 401),
+        };
     }
 
     // Per-PoP namespacing.
@@ -109,7 +137,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .unwrap_or_else(|| "XX".to_string());
 
     let path = req.path();
-    let Some((stream_key, rendition, playlist_type)) = parse_playlist_path(&path) else {
+    let Some((stream_key, _rendition, playlist_type)) = parse_playlist_path(&path) else {
         return cors_error("Not found", 404);
     };
     let url = req.url()?.to_string();
@@ -253,9 +281,42 @@ fn add_cors_ws(resp: Response) -> Response {
 }
 
 fn cors_error(msg: &str, status: u16) -> Result<Response> {
-    let mut h = Headers::new();
+    let h = Headers::new();
     let _ = h.set("Access-Control-Allow-Origin", "*");
     Response::error(msg, status).map(|r| r.with_headers(h))
+}
+
+fn verify_jwt(req: &Request, env: &Env) -> std::result::Result<(), JwtAuthError> {
+    let secret = env
+        .var("JWT_SECRET")
+        .map_err(|_| JwtAuthError::MissingConfig)?
+        .to_string();
+    if secret.is_empty() {
+        return Err(JwtAuthError::MissingConfig);
+    }
+
+    let token = bearer_token(req).ok_or(JwtAuthError::Unauthorized)?;
+
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.required_spec_claims.clear();
+    validation.validate_aud = false;
+
+    decode::<Value>(
+        &token,
+        &DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .map(|_| ())
+    .map_err(|_| JwtAuthError::Unauthorized)
+}
+
+fn bearer_token(req: &Request) -> Option<String> {
+    let auth = req.headers().get("Authorization").ok().flatten()?;
+    auth.strip_prefix("Bearer ")
+        .or_else(|| auth.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
 }
 
 /// Build a forwarding Headers set for a viewer WebSocket upgrade.

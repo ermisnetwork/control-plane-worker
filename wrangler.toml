@@ -18,6 +18,7 @@ new_classes = ["LlHlsDO", "SimpleDO"]
 # Secrets: set via `wrangler secret put`
 #   ORIGIN_BASE_URL - e.g. https://stream-gate.example.com
 #   ORIGIN_SECRET   - shared secret for X-Origin-Secret header
+#   JWT_SECRET      - shared secret used to verify HS256 viewer JWTs
 
 [vars]
 # Must match stream-gate's api_prefix in config.yaml (default: /stream-gate)
