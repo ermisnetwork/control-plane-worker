@@ -46,18 +46,40 @@ async function generateToken(secret, claims = {}) {
 }
 
 async function main() {
-  const secret = process.env.JWT_SECRET || "dev-test-secret-wrong";
-  const workerUrl = process.env.WORKER_URL || "https://control-plane-worker.ermis-network.workers.dev";
-  const streamPath = process.env.STREAM_PATH || "/hls/app/stream/master.m3u8";
-  const token = await generateToken(secret);
+  const secret = process.env.JWT_SECRET || "dev-test-secret";
+  const workerUrl = process.env.WORKER_URL || "https://test-control-plane-worker.ermis-network.workers.dev";
+  const streamId = process.env.STREAM_ID || "019e4f4a-6f6a-7270-a7c4-6cc8507150e5";
+  const streamSessionId = process.env.STREAM_SESSION_ID || "session";
+  const nodeId = process.env.NODE_ID || "node-obs-test-vaapi-9998";
+  const originBaseUrl = process.env.ORIGIN_BASE_URL || "http://localhost:9990";
+  const routeVersion = Number(process.env.ROUTE_VERSION || "1");
+  const playlist = process.env.PLAYLIST || "master";
+  const scope = (process.env.SCOPE || "hls:master,hls:playlist")
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const token = await generateToken(secret, {
+    stream_id: streamId,
+    stream_session_id: streamSessionId,
+    node_id: nodeId,
+    origin_base_url: originBaseUrl,
+    route_version: routeVersion,
+    scope,
+  });
+
+  let playlistPath;
+  if (playlist === "master") {
+    playlistPath = `/hls/t/${token}/live/${encodeURIComponent(streamId)}/master.m3u8`;
+  } else if (playlist === "source") {
+    playlistPath = `/hls/t/${token}/live/${encodeURIComponent(streamId)}/playlist.m3u8`;
+  } else {
+    playlistPath = `/hls/t/${token}/live/${encodeURIComponent(streamId)}/${encodeURIComponent(playlist)}/playlist.m3u8`;
+  }
 
   console.log("JWT:", token);
+  console.log("URL:", `${workerUrl}${playlistPath}`);
 
-  const res = await fetch(`${workerUrl}${streamPath}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
+  const res = await fetch(`${workerUrl}${playlistPath}`);
 
   console.log("Status:", res.status, res.statusText);
   console.log("Body:");

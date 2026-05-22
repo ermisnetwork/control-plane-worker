@@ -1,4 +1,4 @@
-name = "control-plane-worker"
+name = "test-control-plane-worker"
 main = "build/worker/shim.mjs"
 compatibility_date = "2024-12-18"
 
@@ -16,13 +16,10 @@ tag = "v1"
 new_classes = ["LlHlsDO", "SimpleDO"]
 
 # Secrets: set via `wrangler secret put`
-#   ORIGIN_BASE_URL - e.g. https://stream-gate.example.com
-#   ORIGIN_SECRET   - shared secret for X-Origin-Secret header
+#   ORIGIN_SECRET   - shared secret forwarded as origin_secret query param to node /internal/hls-ws
 #   JWT_SECRET      - shared secret used to verify HS256 viewer JWTs
 
 [vars]
-# Must match stream-gate's api_prefix in config.yaml (default: /stream-gate)
-ORIGIN_API_PREFIX  = "/stream-gate"
 # Max concurrent blocking HTTP waiters per DO shard before returning 503 (overflow to next shard).
 MAX_WAITERS_PER_SHARD = "500"
 # Total shard slots available per stream per PoP. hash(IP) % MAX_SHARDS determines starting shard.

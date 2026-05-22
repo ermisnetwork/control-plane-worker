@@ -41,7 +41,6 @@ use futures_channel::oneshot;
 use futures_util::StreamExt;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{cell::RefCell, rc::Rc};
 use worker::*;
 
@@ -50,6 +49,10 @@ use worker::*;
 const VIEWER_TIMEOUT_MS: i64 = 5_000;
 /// Max concurrent HTTP waiters per shard before returning 503.
 const MAX_WAITERS_PER_SHARD: u32 = 500;
+const H_ORIGIN_BASE_URL: &str = "X-Origin-Base-Url";
+const H_ORIGIN_NODE_ID: &str = "X-Origin-Node-Id";
+const H_ORIGIN_STREAM_SESSION_ID: &str = "X-Origin-Stream-Session-Id";
+const H_ORIGIN_ROUTE_VERSION: &str = "X-Origin-Route-Version";
 
 // ── Message types ─────────────────────────────────────────────────────────────
 
@@ -108,6 +111,33 @@ struct HlsQuery {
 enum JwtAuthError {
     MissingConfig,
     Unauthorized,
+    Forbidden,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PlaybackClaims {
+    stream_id: String,
+    stream_session_id: String,
+    node_id: String,
+    origin_base_url: String,
+    route_version: u64,
+    scope: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OriginRoute {
+    origin_base_url: String,
+    node_id: String,
+    stream_session_id: String,
+    route_version: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ParsedRequest {
+    token: String,
+    stream_id: String,
+    stream_key: String,
+    playlist_type: &'static str,
 }
 
 // ── Worker entry ──────────────────────────────────────────────────────────────
@@ -123,13 +153,6 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return Response::empty().map(|r| r.with_headers(h));
     }
 
-    if let Err(e) = verify_jwt(&req, &env) {
-        return match e {
-            JwtAuthError::MissingConfig => cors_error("JWT auth is not configured", 500),
-            JwtAuthError::Unauthorized => cors_error("Unauthorized", 401),
-        };
-    }
-
     // Per-PoP namespacing.
     let colo = req
         .cf()
@@ -137,10 +160,37 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .unwrap_or_else(|| "XX".to_string());
 
     let path = req.path();
-    let Some((stream_key, _rendition, playlist_type)) = parse_playlist_path(&path) else {
+    let Some(parsed) = parse_playlist_path(&path) else {
         return cors_error("Not found", 404);
     };
+    if parsed.playlist_type == "media" {
+        return cors_error("Media objects are served by CDN, not this Worker", 404);
+    }
+    let claims = match verify_playback_token(&parsed.token, &env) {
+        Ok(claims) => claims,
+        Err(e) => {
+            return match e {
+                JwtAuthError::MissingConfig => cors_error("JWT auth is not configured", 500),
+                JwtAuthError::Unauthorized => cors_error("Unauthorized", 401),
+                JwtAuthError::Forbidden => cors_error("Forbidden", 403),
+            };
+        }
+    };
+    if let Err(e) = authorize_parsed_request(&parsed, &claims) {
+        return match e {
+            JwtAuthError::MissingConfig => cors_error("JWT auth is not configured", 500),
+            JwtAuthError::Unauthorized => cors_error("Unauthorized", 401),
+            JwtAuthError::Forbidden => cors_error("Forbidden", 403),
+        };
+    }
+    let stream_key = parsed.stream_key.clone();
     let url = req.url()?.to_string();
+    let route = OriginRoute {
+        origin_base_url: normalize_origin_base(&claims.origin_base_url),
+        node_id: claims.node_id.clone(),
+        stream_session_id: claims.stream_session_id.clone(),
+        route_version: claims.route_version,
+    };
 
     let ip = req
         .headers()
@@ -149,7 +199,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let max_shards = get_max_shards(&env);
     let start_shard = djb2_hash(&ip) % max_shards;
 
-    match playlist_type {
+    match parsed.playlist_type {
         // ── Blocking HTTP: LL-HLS ──────────────────────────────────────────────
         "llhls" => {
             let ll_ns = env.durable_object("LL_HLS_DO")?;
@@ -158,8 +208,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let ll_id =
                     ll_ns.id_from_name(&format!("{}:ll:{}:{}", stream_key, colo, shard_id))?;
                 let ll_stub = ll_id.get_stub()?;
-                let mut fwd = Headers::new();
+                let fwd = Headers::new();
                 fwd.set("X-Stream-Key", &stream_key)?;
+                set_origin_route_headers(&fwd, &route)?;
                 let do_req = Request::new_with_init(
                     &url,
                     RequestInit::new()
@@ -183,8 +234,9 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let simple_id = simple_ns
                     .id_from_name(&format!("{}:simple:{}:{}", stream_key, colo, shard_id))?;
                 let simple_stub = simple_id.get_stub()?;
-                let mut fwd = Headers::new();
+                let fwd = Headers::new();
                 fwd.set("X-Stream-Key", &stream_key)?;
+                set_origin_route_headers(&fwd, &route)?;
                 let do_req = Request::new_with_init(
                     &url,
                     RequestInit::new()
@@ -208,9 +260,10 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 let ll_id =
                     ll_ns.id_from_name(&format!("{}:ll:{}:{}", stream_key, colo, shard_id))?;
                 let ll_stub = ll_id.get_stub()?;
-                let mut fwd = Headers::new();
+                let fwd = Headers::new();
                 fwd.set("X-Stream-Key", &stream_key)?;
                 fwd.set("X-Playlist-Type", "master")?;
+                set_origin_route_headers(&fwd, &route)?;
                 let do_req = Request::new_with_init(
                     &url,
                     RequestInit::new()
@@ -235,6 +288,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             let ll_id = ll_ns.id_from_name(&format!("{}:ll:{}:{}", stream_key, colo, shard_id))?;
             let ll_stub = ll_id.get_stub()?;
             let fwd = copy_ws_headers(&req, &stream_key, true)?;
+            set_origin_route_headers(&fwd, &route)?;
             let do_req = Request::new_with_init(
                 &url,
                 RequestInit::new()
@@ -253,6 +307,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 simple_ns.id_from_name(&format!("{}:simple:{}:{}", stream_key, colo, shard_id))?;
             let simple_stub = simple_id.get_stub()?;
             let fwd = copy_ws_headers(&req, &stream_key, true)?;
+            set_origin_route_headers(&fwd, &route)?;
             let do_req = Request::new_with_init(
                 &url,
                 RequestInit::new()
@@ -270,7 +325,7 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 }
 
 fn add_cors(resp: Response) -> Result<Response> {
-    let mut h = resp.headers().clone();
+    let h = resp.headers().clone();
     h.set("Access-Control-Allow-Origin", "*")?;
     Ok(resp.with_headers(h))
 }
@@ -286,7 +341,10 @@ fn cors_error(msg: &str, status: u16) -> Result<Response> {
     Response::error(msg, status).map(|r| r.with_headers(h))
 }
 
-fn verify_jwt(req: &Request, env: &Env) -> std::result::Result<(), JwtAuthError> {
+fn verify_playback_token(
+    token: &str,
+    env: &Env,
+) -> std::result::Result<PlaybackClaims, JwtAuthError> {
     let secret = env
         .var("JWT_SECRET")
         .map_err(|_| JwtAuthError::MissingConfig)?
@@ -295,28 +353,54 @@ fn verify_jwt(req: &Request, env: &Env) -> std::result::Result<(), JwtAuthError>
         return Err(JwtAuthError::MissingConfig);
     }
 
-    let token = bearer_token(req).ok_or(JwtAuthError::Unauthorized)?;
-
     let mut validation = Validation::new(Algorithm::HS256);
     validation.required_spec_claims.clear();
     validation.validate_aud = false;
 
-    decode::<Value>(
-        &token,
+    decode::<PlaybackClaims>(
+        token,
         &DecodingKey::from_secret(secret.as_bytes()),
         &validation,
     )
-    .map(|_| ())
+    .map(|data| data.claims)
     .map_err(|_| JwtAuthError::Unauthorized)
 }
 
-fn bearer_token(req: &Request) -> Option<String> {
-    let auth = req.headers().get("Authorization").ok().flatten()?;
-    auth.strip_prefix("Bearer ")
-        .or_else(|| auth.strip_prefix("bearer "))
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-        .map(str::to_string)
+fn authorize_parsed_request(
+    parsed: &ParsedRequest,
+    claims: &PlaybackClaims,
+) -> std::result::Result<(), JwtAuthError> {
+    if parsed.stream_id != claims.stream_id {
+        return Err(JwtAuthError::Forbidden);
+    }
+    if claims.stream_session_id.trim().is_empty()
+        || claims.node_id.trim().is_empty()
+        || claims.origin_base_url.trim().is_empty()
+    {
+        return Err(JwtAuthError::Forbidden);
+    }
+    let required_scope = match parsed.playlist_type {
+        "master" => "hls:master",
+        "llhls" | "llhls-ws" => "hls:playlist",
+        "simple" | "simple-ws" => "hls:playlist",
+        _ => return Err(JwtAuthError::Forbidden),
+    };
+    if !claims.scope.iter().any(|scope| scope == required_scope) {
+        return Err(JwtAuthError::Forbidden);
+    }
+    Ok(())
+}
+
+fn normalize_origin_base(origin: &str) -> String {
+    origin.trim_end_matches('/').to_string()
+}
+
+fn set_origin_route_headers(headers: &Headers, route: &OriginRoute) -> Result<()> {
+    headers.set(H_ORIGIN_BASE_URL, &route.origin_base_url)?;
+    headers.set(H_ORIGIN_NODE_ID, &route.node_id)?;
+    headers.set(H_ORIGIN_STREAM_SESSION_ID, &route.stream_session_id)?;
+    headers.set(H_ORIGIN_ROUTE_VERSION, &route.route_version.to_string())?;
+    Ok(())
 }
 
 /// Build a forwarding Headers set for a viewer WebSocket upgrade.
@@ -326,7 +410,7 @@ fn bearer_token(req: &Request) -> Option<String> {
 /// Also adds our internal routing headers (X-Stream-Key, X-Viewer-WS).
 fn copy_ws_headers(req: &Request, stream_key: &str, is_viewer_ws: bool) -> Result<Headers> {
     let src = req.headers();
-    let mut dst = Headers::new();
+    let dst = Headers::new();
 
     // WebSocket handshake fields (RFC 6455)
     for name in &[
@@ -369,6 +453,8 @@ struct LlHlsInner {
     current_msn: u64,
     current_part: u32,
     playlist: String,
+    stream_key: String,
+    origin_route: Option<OriginRoute>,
     /// HTTP blocking waiters: (req_msn, req_part, sender)
     http_waiters: Vec<(u64, u32, oneshot::Sender<String>)>,
     /// Connected viewer WebSockets for push delivery
@@ -388,6 +474,8 @@ impl Default for LlHlsInner {
             current_msn: 0,
             current_part: 0,
             playlist: String::new(),
+            stream_key: String::new(),
+            origin_route: None,
             http_waiters: Vec::new(),
             viewer_ws: Vec::new(),
             initialized: false,
@@ -463,14 +551,7 @@ impl DurableObject for LlHlsDO {
             }
         }
 
-        let stream_key = req.headers().get("X-Stream-Key")?.unwrap_or_default();
-        if !stream_key.is_empty() {
-            let existing: Option<String> =
-                self.state.storage().get("stream_key").await.ok().flatten();
-            if existing.is_none() {
-                let _ = self.state.storage().put("stream_key", &stream_key).await;
-            }
-        }
+        self.configure_origin_route(&req).await?;
 
         let query: HlsQuery = req.query().unwrap_or_default();
         let is_initial = req
@@ -557,6 +638,44 @@ impl DurableObject for LlHlsDO {
 }
 
 impl LlHlsDO {
+    async fn configure_origin_route(&self, req: &Request) -> Result<()> {
+        let stream_key = req.headers().get("X-Stream-Key")?.unwrap_or_default();
+        if stream_key.is_empty() {
+            return Err(Error::RustError("missing X-Stream-Key".into()));
+        }
+        let route = origin_route_from_headers(req.headers())?;
+        let mut g = self.inner.borrow_mut();
+        match &g.origin_route {
+            Some(current) if current == &route && g.stream_key == stream_key => return Ok(()),
+            Some(current) if route.route_version < current.route_version => {
+                return Err(Error::RustError("stale origin route".into()));
+            }
+            Some(current) if route.route_version == current.route_version => {
+                return Err(Error::RustError("conflicting origin route".into()));
+            }
+            Some(_) => {
+                g.current_msn = 0;
+                g.current_part = 0;
+                g.playlist.clear();
+                g.master_playlist.clear();
+                for (_, _, tx) in g.http_waiters.drain(..) {
+                    let _ = tx.send(String::new());
+                }
+                for tx in g.master_waiters.drain(..) {
+                    let _ = tx.send(String::new());
+                }
+                g.origin_connected = false;
+                g.should_clear = false;
+            }
+            None => {}
+        }
+        g.stream_key = stream_key.clone();
+        g.origin_route = Some(route);
+        drop(g);
+        let _ = self.state.storage().put("stream_key", &stream_key).await;
+        Ok(())
+    }
+
     async fn handle_master_request(&self, req: &Request) -> Result<Response> {
         // 1. Fast path: already have master in memory
         {
@@ -577,16 +696,7 @@ impl LlHlsDO {
             }
         }
 
-        // 3. Persist stream_key so cold-start master requests can bootstrap the
-        // origin WS the same way playlist.m3u8 requests do.
-        let stream_key = req.headers().get("X-Stream-Key")?.unwrap_or_default();
-        if !stream_key.is_empty() {
-            let existing: Option<String> =
-                self.state.storage().get("stream_key").await.ok().flatten();
-            if existing.is_none() {
-                let _ = self.state.storage().put("stream_key", &stream_key).await;
-            }
-        }
+        self.configure_origin_route(req).await?;
 
         // 4. Connect origin WS (if not already connected)
         if let Err(e) = self.ensure_origin_ws().await {
@@ -641,14 +751,7 @@ impl LlHlsDO {
     /// After upgrade, immediately sends the current playlist (if available)
     /// so the client can render right away — then stays connected for push updates.
     async fn handle_viewer_ws(&self, req: Request) -> Result<Response> {
-        let stream_key = req.headers().get("X-Stream-Key")?.unwrap_or_default();
-        if !stream_key.is_empty() {
-            let existing: Option<String> =
-                self.state.storage().get("stream_key").await.ok().flatten();
-            if existing.is_none() {
-                let _ = self.state.storage().put("stream_key", &stream_key).await;
-            }
-        }
+        self.configure_origin_route(&req).await?;
 
         // Ensure origin WS is active so we receive future playlist updates.
         if let Err(e) = self.ensure_origin_ws().await {
@@ -702,7 +805,16 @@ impl LlHlsDO {
         if self.inner.borrow().origin_connected {
             return Ok(());
         }
-        let wss_url = build_ws_url(&self.env, &self.state).await?;
+        let (stream_key, route) = {
+            let g = self.inner.borrow();
+            (
+                g.stream_key.clone(),
+                g.origin_route
+                    .clone()
+                    .ok_or_else(|| Error::RustError("origin route not set".into()))?,
+            )
+        };
+        let wss_url = build_ws_url(&self.env, &stream_key, &route)?;
         self.inner.borrow_mut().origin_connected = true;
         let inner = self.inner.clone();
 
@@ -717,6 +829,9 @@ impl LlHlsDO {
                             part,
                             playlist,
                         } => {
+                            if inner.borrow().origin_route.as_ref() != Some(&route) {
+                                return true;
+                            }
                             let mut g = inner.borrow_mut();
                             g.current_msn = msn;
                             g.current_part = part;
@@ -749,6 +864,9 @@ impl LlHlsDO {
                         }
                         OriginMsg::Simple { .. } => false, // LlHlsDO ignores Simple msgs
                         OriginMsg::Master { playlist } => {
+                            if inner.borrow().origin_route.as_ref() != Some(&route) {
+                                return true;
+                            }
                             let mut g = inner.borrow_mut();
                             g.master_playlist = playlist.clone();
                             // Wake ALL master waiters (no selectivity — master is stateless)
@@ -758,6 +876,9 @@ impl LlHlsDO {
                             false // keep running
                         }
                         OriginMsg::End => {
+                            if inner.borrow().origin_route.as_ref() != Some(&route) {
+                                return true;
+                            }
                             let mut g = inner.borrow_mut();
                             let pl = g.playlist.clone();
                             let master_pl = g.master_playlist.clone();
@@ -793,6 +914,8 @@ impl LlHlsDO {
 struct SimpleInner {
     simple_playlist: String,
     simple_seq: u64,
+    stream_key: String,
+    origin_route: Option<OriginRoute>,
     /// HTTP blocking waiters
     http_waiters: Vec<oneshot::Sender<String>>,
     /// Connected viewer WebSockets for push delivery
@@ -807,6 +930,8 @@ impl Default for SimpleInner {
         Self {
             simple_playlist: String::new(),
             simple_seq: 0,
+            stream_key: String::new(),
+            origin_route: None,
             http_waiters: Vec::new(),
             viewer_ws: Vec::new(),
             initialized: false,
@@ -871,14 +996,7 @@ impl DurableObject for SimpleDO {
             }
         }
 
-        let stream_key = req.headers().get("X-Stream-Key")?.unwrap_or_default();
-        if !stream_key.is_empty() {
-            let existing: Option<String> =
-                self.state.storage().get("stream_key").await.ok().flatten();
-            if existing.is_none() {
-                let _ = self.state.storage().put("stream_key", &stream_key).await;
-            }
-        }
+        self.configure_origin_route(&req).await?;
 
         let simple_now = self.inner.borrow().simple_playlist.clone();
 
@@ -949,6 +1067,39 @@ impl DurableObject for SimpleDO {
 }
 
 impl SimpleDO {
+    async fn configure_origin_route(&self, req: &Request) -> Result<()> {
+        let stream_key = req.headers().get("X-Stream-Key")?.unwrap_or_default();
+        if stream_key.is_empty() {
+            return Err(Error::RustError("missing X-Stream-Key".into()));
+        }
+        let route = origin_route_from_headers(req.headers())?;
+        let mut g = self.inner.borrow_mut();
+        match &g.origin_route {
+            Some(current) if current == &route && g.stream_key == stream_key => return Ok(()),
+            Some(current) if route.route_version < current.route_version => {
+                return Err(Error::RustError("stale origin route".into()));
+            }
+            Some(current) if route.route_version == current.route_version => {
+                return Err(Error::RustError("conflicting origin route".into()));
+            }
+            Some(_) => {
+                g.simple_playlist.clear();
+                g.simple_seq = 0;
+                for tx in g.http_waiters.drain(..) {
+                    let _ = tx.send(String::new());
+                }
+                g.origin_connected = false;
+                g.should_clear = false;
+            }
+            None => {}
+        }
+        g.stream_key = stream_key.clone();
+        g.origin_route = Some(route);
+        drop(g);
+        let _ = self.state.storage().put("stream_key", &stream_key).await;
+        Ok(())
+    }
+
     async fn ensure_initialized(&self) -> Result<()> {
         if self.inner.borrow().initialized {
             return Ok(());
@@ -969,14 +1120,7 @@ impl SimpleDO {
     }
 
     async fn handle_viewer_ws(&self, req: Request) -> Result<Response> {
-        let stream_key = req.headers().get("X-Stream-Key")?.unwrap_or_default();
-        if !stream_key.is_empty() {
-            let existing: Option<String> =
-                self.state.storage().get("stream_key").await.ok().flatten();
-            if existing.is_none() {
-                let _ = self.state.storage().put("stream_key", &stream_key).await;
-            }
-        }
+        self.configure_origin_route(&req).await?;
 
         if let Err(e) = self.ensure_origin_ws().await {
             console_log!("[SimpleDO] ensure_origin_ws error (viewer ws): {:?}", e);
@@ -1019,7 +1163,16 @@ impl SimpleDO {
         if self.inner.borrow().origin_connected {
             return Ok(());
         }
-        let wss_url = build_ws_url(&self.env, &self.state).await?;
+        let (stream_key, route) = {
+            let g = self.inner.borrow();
+            (
+                g.stream_key.clone(),
+                g.origin_route
+                    .clone()
+                    .ok_or_else(|| Error::RustError("origin route not set".into()))?,
+            )
+        };
+        let wss_url = build_ws_url(&self.env, &stream_key, &route)?;
         self.inner.borrow_mut().origin_connected = true;
         let inner = self.inner.clone();
 
@@ -1030,6 +1183,9 @@ impl SimpleDO {
                 move |msg, ws| {
                     match msg {
                         OriginMsg::Simple { seq, playlist } => {
+                            if inner.borrow().origin_route.as_ref() != Some(&route) {
+                                return true;
+                            }
                             let mut g = inner.borrow_mut();
                             if seq >= g.simple_seq {
                                 g.simple_seq = seq;
@@ -1057,6 +1213,9 @@ impl SimpleDO {
                         OriginMsg::Part { .. } => false, // SimpleDO ignores Part msgs
                         OriginMsg::Master { .. } => false, // SimpleDO ignores Master msgs
                         OriginMsg::End => {
+                            if inner.borrow().origin_route.as_ref() != Some(&route) {
+                                return true;
+                            }
                             let mut g = inner.borrow_mut();
                             let pl = g.simple_playlist.clone();
                             for tx in g.http_waiters.drain(..) {
@@ -1081,34 +1240,47 @@ impl SimpleDO {
 
 // ── Shared WS runtime ─────────────────────────────────────────────────────────
 
-async fn build_ws_url(env: &Env, state: &State) -> Result<String> {
-    let origin_base = env.var("ORIGIN_BASE_URL")?.to_string();
-    let api_prefix = env
-        .var("ORIGIN_API_PREFIX")
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| "/stream-gate".to_string());
+fn origin_route_from_headers(headers: &Headers) -> Result<OriginRoute> {
+    let origin_base_url = headers
+        .get(H_ORIGIN_BASE_URL)?
+        .ok_or_else(|| Error::RustError("missing origin base url".into()))?;
+    let node_id = headers
+        .get(H_ORIGIN_NODE_ID)?
+        .ok_or_else(|| Error::RustError("missing origin node id".into()))?;
+    let stream_session_id = headers
+        .get(H_ORIGIN_STREAM_SESSION_ID)?
+        .ok_or_else(|| Error::RustError("missing origin stream session id".into()))?;
+    let route_version = headers
+        .get(H_ORIGIN_ROUTE_VERSION)?
+        .ok_or_else(|| Error::RustError("missing origin route version".into()))?
+        .parse()
+        .map_err(|_| Error::RustError("invalid origin route version".into()))?;
+    Ok(OriginRoute {
+        origin_base_url: normalize_origin_base(&origin_base_url),
+        node_id,
+        stream_session_id,
+        route_version,
+    })
+}
 
-    let stream_key: String = state
-        .storage()
-        .get("stream_key")
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-
+fn build_ws_url(env: &Env, stream_key: &str, route: &OriginRoute) -> Result<String> {
     if stream_key.is_empty() {
         return Err(Error::RustError("stream_key not set".into()));
     }
-
-    Ok(format!(
-        "{}{}/internal/hls-ws/{}",
-        origin_base
-            .trim_end_matches('/')
+    let secret = env.var("ORIGIN_SECRET").ok().map(|v| v.to_string());
+    let mut url = format!(
+        "{}/internal/hls-ws/{}",
+        route
+            .origin_base_url
             .replace("https://", "wss://")
             .replace("http://", "ws://"),
-        api_prefix,
         url_encode(&stream_key),
-    ))
+    );
+    if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+        url.push_str("?origin_secret=");
+        url.push_str(&url_encode(&secret));
+    }
+    Ok(url)
 }
 
 fn push_viewer_count(ws: &WebSocket, count: u32, msn: u64, part: u32) {
@@ -1163,7 +1335,7 @@ fn satisfies(cur_msn: u64, cur_part: u32, req_msn: u64, req_part: u32) -> bool {
 }
 
 fn ll_playlist_response(playlist: &str, waiter_count: u32) -> Result<Response> {
-    let mut h = Headers::new();
+    let h = Headers::new();
     let _ = h.set("Content-Type", "application/vnd.apple.mpegurl");
     let _ = h.set("Cache-Control", "no-store");
     let _ = h.set("Access-Control-Allow-Origin", "*");
@@ -1172,7 +1344,7 @@ fn ll_playlist_response(playlist: &str, waiter_count: u32) -> Result<Response> {
 }
 
 fn simple_playlist_response(playlist: &str, viewer_count: u32) -> Result<Response> {
-    let mut h = Headers::new();
+    let h = Headers::new();
     let _ = h.set("Content-Type", "application/vnd.apple.mpegurl");
     let _ = h.set(
         "Cache-Control",
@@ -1184,58 +1356,51 @@ fn simple_playlist_response(playlist: &str, viewer_count: u32) -> Result<Respons
 }
 
 fn master_playlist_response(playlist: &str) -> Result<Response> {
-    let mut h = Headers::new();
+    let h = Headers::new();
     let _ = h.set("Content-Type", "application/vnd.apple.mpegurl");
     let _ = h.set("Cache-Control", "no-store");
     let _ = h.set("Access-Control-Allow-Origin", "*");
     Response::ok(playlist).map(|r| r.with_headers(h))
 }
 
-/// Parse path → (stream_key, rendition, playlist_type)
-/// Supports both software (/hls/{app}/{sid}[/{rend}]/...) and browser (/browser/hls/{uuid}[/{rend}]/...) formats.
-fn parse_playlist_path(path: &str) -> Option<(String, Option<String>, &'static str)> {
+/// Parse tokenized playback paths handled by this Worker.
+///
+/// Playlists are relayed through DO. Media objects are intentionally rejected
+/// because init/segment/part delivery is owned by CDN/origin routing outside
+/// this Worker.
+fn parse_playlist_path(path: &str) -> Option<ParsedRequest> {
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    let hls_pos = segs.iter().position(|s| *s == "hls")?;
-
-    // ── Browser stream: /browser/hls/{stream_id}[/{rend}]/playlist.m3u8 ─────────
-    // segs before hls includes "browser": ["browser", ...]
-    // After hls: ["{stream_id}", filename] or ["{stream_id}", "{rend}", filename]
-    if hls_pos > 0 && segs[hls_pos - 1] == "browser" {
-        let rest = &segs[hls_pos + 1..];
-        match rest {
-            [stream_id, filename] => {
-                let t = playlist_type(filename)?;
-                // Browser stream_key must match what origin DoBroadcaster uses:
-                // publisher_common.rs broadcasts under "browser:{uuid}" — we must use the same key
-                // so the DO's back-channel /internal/hls-ws/{stream_key} resolves correctly.
-                Some((format!("browser:{}", stream_id), None, t))
-            }
-            [stream_id, rend, filename] => {
-                let t = playlist_type(filename)?;
-                Some((format!("browser:{}", stream_id), Some(rend.to_string()), t))
-            }
-            _ => None,
+    match segs.as_slice() {
+        ["hls", "t", token, "live", stream_id, filename] => {
+            let playlist_type = playlist_type(filename)?;
+            Some(ParsedRequest {
+                token: (*token).to_string(),
+                stream_id: (*stream_id).to_string(),
+                stream_key: (*stream_id).to_string(),
+                playlist_type,
+            })
         }
-    } else {
-        // ── Software stream: /hls/{app}/{sid}[/{rend}]/playlist.m3u8 ─────────────
-        // After hls: ["{app}", "{sid}", filename] or ["{app}", "{sid}", "{rend}", filename]
-        match &segs[hls_pos + 1..] {
-            [app, sid, filename] => {
-                let t = playlist_type(filename)?;
-                let stream_key = format!("{}:{}", app, sid);
-                Some((stream_key, None, t))
-            }
-            [app, sid, rend, filename] => {
-                let t = playlist_type(filename)?;
-                let stream_key = if *rend != "original" {
-                    format!("{}:{}:{}", app, sid, rend)
-                } else {
-                    format!("{}:{}", app, sid)
-                };
-                Some((stream_key, None, t))
-            }
-            _ => None,
+        ["hls", "t", token, "live", stream_id, rendition, filename] => {
+            let playlist_type = playlist_type(filename)?;
+            let stream_key = if *rendition == "source" || *rendition == "original" {
+                (*stream_id).to_string()
+            } else {
+                format!("{stream_id}:{rendition}")
+            };
+            Some(ParsedRequest {
+                token: (*token).to_string(),
+                stream_id: (*stream_id).to_string(),
+                stream_key,
+                playlist_type,
+            })
         }
+        ["hls", "t", token, "live", stream_id, ..] => Some(ParsedRequest {
+            token: (*token).to_string(),
+            stream_id: (*stream_id).to_string(),
+            stream_key: (*stream_id).to_string(),
+            playlist_type: "media",
+        }),
+        _ => None,
     }
 }
 
