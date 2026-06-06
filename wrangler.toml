@@ -20,6 +20,8 @@ new_classes = ["LlHlsDO", "SimpleDO"]
 #   JWT_SECRET      - shared secret used to verify HS256 viewer JWTs
 
 [vars]
+# Default deployment keeps playback JWT verification enabled.
+PLAYBACK_AUTH_MODE = "required"
 # Max concurrent blocking HTTP waiters per DO shard before returning 503 (overflow to next shard).
 MAX_WAITERS_PER_SHARD = "500"
 # Total shard slots available per stream per PoP. hash(IP) % MAX_SHARDS determines starting shard.

@@ -5,6 +5,12 @@
 //!   - SimpleDO : simple.m3u8 blocking + WS viewer push.
 //!
 //! Worker entry routes:
+//!   Public relay mode (`PLAYBACK_AUTH_MODE=disabled`):
+//!     /hls/live/{stream_id}/master.m3u8
+//!     /hls/live/{stream_id}[/{rendition}]/playlist.m3u8
+//!     /hls/live/{stream_id}[/{rendition}]/simple.m3u8
+//!
+//!   Token-authenticated mode (default):
 //!   Software streams:
 //!     /hls/{app}/{sid}/master.m3u8
 //!     /hls/{app}/{sid}[/{rendition}]/playlist.m3u8
@@ -134,7 +140,7 @@ struct OriginRoute {
 
 #[derive(Debug, Clone)]
 struct ParsedRequest {
-    token: String,
+    token: Option<String>,
     stream_id: String,
     stream_key: String,
     playlist_type: &'static str,
@@ -166,31 +172,20 @@ pub async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     if parsed.playlist_type == "media" {
         return cors_error("Media objects are served by CDN, not this Worker", 404);
     }
-    let claims = match verify_playback_token(&parsed.token, &env) {
-        Ok(claims) => claims,
+    let route = match resolve_origin_route(&parsed, &env) {
+        Ok(route) => route,
         Err(e) => {
             return match e {
-                JwtAuthError::MissingConfig => cors_error("JWT auth is not configured", 500),
+                JwtAuthError::MissingConfig => {
+                    cors_error("Relay auth/route is not configured", 500)
+                }
                 JwtAuthError::Unauthorized => cors_error("Unauthorized", 401),
                 JwtAuthError::Forbidden => cors_error("Forbidden", 403),
             };
         }
     };
-    if let Err(e) = authorize_parsed_request(&parsed, &claims) {
-        return match e {
-            JwtAuthError::MissingConfig => cors_error("JWT auth is not configured", 500),
-            JwtAuthError::Unauthorized => cors_error("Unauthorized", 401),
-            JwtAuthError::Forbidden => cors_error("Forbidden", 403),
-        };
-    }
     let stream_key = parsed.stream_key.clone();
     let url = req.url()?.to_string();
-    let route = OriginRoute {
-        origin_base_url: normalize_origin_base(&claims.origin_base_url),
-        node_id: claims.node_id.clone(),
-        stream_session_id: claims.stream_session_id.clone(),
-        route_version: claims.route_version,
-    };
 
     let ip = req
         .headers()
@@ -364,6 +359,63 @@ fn verify_playback_token(
     )
     .map(|data| data.claims)
     .map_err(|_| JwtAuthError::Unauthorized)
+}
+
+fn resolve_origin_route(
+    parsed: &ParsedRequest,
+    env: &Env,
+) -> std::result::Result<OriginRoute, JwtAuthError> {
+    if playback_auth_disabled(env) {
+        return static_origin_route(env);
+    }
+
+    let token = parsed.token.as_deref().ok_or(JwtAuthError::Unauthorized)?;
+    let claims = verify_playback_token(token, env)?;
+    authorize_parsed_request(parsed, &claims)?;
+    Ok(OriginRoute {
+        origin_base_url: normalize_origin_base(&claims.origin_base_url),
+        node_id: claims.node_id,
+        stream_session_id: claims.stream_session_id,
+        route_version: claims.route_version,
+    })
+}
+
+fn playback_auth_disabled(env: &Env) -> bool {
+    env.var("PLAYBACK_AUTH_MODE")
+        .ok()
+        .map(|value| value.to_string().eq_ignore_ascii_case("disabled"))
+        .unwrap_or(false)
+}
+
+fn static_origin_route(env: &Env) -> std::result::Result<OriginRoute, JwtAuthError> {
+    let origin_base_url = env
+        .var("ORIGIN_BASE_URL")
+        .map_err(|_| JwtAuthError::MissingConfig)?
+        .to_string();
+    if origin_base_url.trim().is_empty() {
+        return Err(JwtAuthError::MissingConfig);
+    }
+
+    let node_id = env
+        .var("ORIGIN_NODE_ID")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "public-relay".to_string());
+    let stream_session_id = env
+        .var("ORIGIN_STREAM_SESSION_ID")
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| "public-relay".to_string());
+    let route_version = env
+        .var("ORIGIN_ROUTE_VERSION")
+        .ok()
+        .and_then(|value| value.to_string().parse().ok())
+        .unwrap_or(1);
+
+    Ok(OriginRoute {
+        origin_base_url: normalize_origin_base(&origin_base_url),
+        node_id,
+        stream_session_id,
+        route_version,
+    })
 }
 
 fn authorize_parsed_request(
@@ -1371,10 +1423,39 @@ fn master_playlist_response(playlist: &str) -> Result<Response> {
 fn parse_playlist_path(path: &str) -> Option<ParsedRequest> {
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match segs.as_slice() {
+        ["hls", "live", stream_id, filename] => {
+            let playlist_type = playlist_type(filename)?;
+            Some(ParsedRequest {
+                token: None,
+                stream_id: (*stream_id).to_string(),
+                stream_key: (*stream_id).to_string(),
+                playlist_type,
+            })
+        }
+        ["hls", "live", stream_id, rendition, filename] => {
+            let playlist_type = playlist_type(filename)?;
+            let stream_key = if *rendition == "source" || *rendition == "original" {
+                (*stream_id).to_string()
+            } else {
+                format!("{stream_id}:{rendition}")
+            };
+            Some(ParsedRequest {
+                token: None,
+                stream_id: (*stream_id).to_string(),
+                stream_key,
+                playlist_type,
+            })
+        }
+        ["hls", "live", stream_id, ..] => Some(ParsedRequest {
+            token: None,
+            stream_id: (*stream_id).to_string(),
+            stream_key: (*stream_id).to_string(),
+            playlist_type: "media",
+        }),
         ["hls", "t", token, "live", stream_id, filename] => {
             let playlist_type = playlist_type(filename)?;
             Some(ParsedRequest {
-                token: (*token).to_string(),
+                token: Some((*token).to_string()),
                 stream_id: (*stream_id).to_string(),
                 stream_key: (*stream_id).to_string(),
                 playlist_type,
@@ -1388,14 +1469,14 @@ fn parse_playlist_path(path: &str) -> Option<ParsedRequest> {
                 format!("{stream_id}:{rendition}")
             };
             Some(ParsedRequest {
-                token: (*token).to_string(),
+                token: Some((*token).to_string()),
                 stream_id: (*stream_id).to_string(),
                 stream_key,
                 playlist_type,
             })
         }
         ["hls", "t", token, "live", stream_id, ..] => Some(ParsedRequest {
-            token: (*token).to_string(),
+            token: Some((*token).to_string()),
             stream_id: (*stream_id).to_string(),
             stream_key: (*stream_id).to_string(),
             playlist_type: "media",
@@ -1432,4 +1513,33 @@ fn get_max_shards(env: &Env) -> u32 {
         .ok()
         .and_then(|v| v.to_string().parse().ok())
         .unwrap_or(250)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_public_relay_master_path() {
+        let parsed = parse_playlist_path("/hls/live/stream-1/master.m3u8").unwrap();
+        assert_eq!(parsed.token, None);
+        assert_eq!(parsed.stream_id, "stream-1");
+        assert_eq!(parsed.stream_key, "stream-1");
+        assert_eq!(parsed.playlist_type, "master");
+    }
+
+    #[test]
+    fn parses_public_relay_rendition_path() {
+        let parsed = parse_playlist_path("/hls/live/stream-1/720p/playlist.m3u8").unwrap();
+        assert_eq!(parsed.token, None);
+        assert_eq!(parsed.stream_key, "stream-1:720p");
+        assert_eq!(parsed.playlist_type, "llhls");
+    }
+
+    #[test]
+    fn keeps_tokenized_path_compatible() {
+        let parsed = parse_playlist_path("/hls/t/token/live/stream-1/master.m3u8").unwrap();
+        assert_eq!(parsed.token.as_deref(), Some("token"));
+        assert_eq!(parsed.stream_key, "stream-1");
+    }
 }

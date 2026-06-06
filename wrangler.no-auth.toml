@@ -1,0 +1,29 @@
+name = "test-control-plane-worker-no-auth"
+main = "build/worker/shim.mjs"
+compatibility_date = "2024-12-18"
+
+[build]
+command = "cargo install -q worker-build@^0.7 && worker-build --release"
+
+[durable_objects]
+bindings = [
+  { name = "LL_HLS_DO", class_name = "LlHlsDO" },
+  { name = "SIMPLE_DO", class_name = "SimpleDO" },
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["LlHlsDO", "SimpleDO"]
+
+# Set ORIGIN_SECRET with:
+#   npx wrangler secret put ORIGIN_SECRET --config wrangler.no-auth.toml
+#
+# This deployment intentionally performs no client playback authorization.
+[vars]
+PLAYBACK_AUTH_MODE = "disabled"
+ORIGIN_BASE_URL = "https://hb.ermis.network"
+ORIGIN_NODE_ID = "hb-public-relay"
+ORIGIN_STREAM_SESSION_ID = "public-relay"
+ORIGIN_ROUTE_VERSION = "1"
+MAX_WAITERS_PER_SHARD = "500"
+MAX_SHARDS = "250"
